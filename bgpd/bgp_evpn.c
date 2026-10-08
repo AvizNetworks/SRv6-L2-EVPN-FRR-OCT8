@@ -3898,6 +3898,19 @@ static void bgp_evpn_srv6_refresh_vni_originator_hash(struct hash_bucket *bucket
 		return;
 
 	vpn = (struct bgpevpn *)bucket->data;
+
+	/*
+	 * Only SRv6 EVIs get an IPv6 originator re-derived here.  A pure-VXLAN
+	 * VNI must keep the IPv4 VTEP that zebra reported from its vxlan
+	 * device's `local` address - clobbering it with the SRv6 IPv6
+	 * originator makes the IMET/Type-2 routes carry an IPv6 VTEP that the
+	 * far end cannot program onto an IPv4 vxlan device (no flood FDB entry,
+	 * BUM/ARP blackholed).  is_vpn_srv6() is true only when the VNI has a
+	 * valid End.DT2U/DT2M SID, i.e. it is genuinely SRv6-backed.
+	 */
+	if (!is_vpn_srv6(vpn))
+		return;
+
 	if (IS_IPADDR_V6(&vpn->originator_ip))
 		return;
 
