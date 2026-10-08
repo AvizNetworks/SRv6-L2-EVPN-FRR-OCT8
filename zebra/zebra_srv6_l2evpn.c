@@ -1027,15 +1027,19 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	zebra_evpn_send_add_to_client(zevpn);
 
 	/* RFC 9135 section 9: Anycast Gateway advertisement.
-	 * For IRB-enabled EVIs (VRF binding present), advertise the bridge
-	 * SVI MAC+IP as a sticky Default GW Type-2 route.  This allows remote
-	 * PEs to suppress ARP/ND for the gateway IP and enables seamless CE
-	 * mobility without re-ARPing.  The MACIP send is idempotent -- it
-	 * overwrites any stale entry with fresh SID-embedded attributes. */
-	if (evi->vrf_id != VRF_DEFAULT && evi->bridge_if) {
-		zevpn->advertise_gw_macip = 1;
+	 * For IRB-enabled EVIs (VRF binding present), (re)register the bridge
+	 * SVI MAC+IP as the local gateway entry so it's ready to advertise as
+	 * a sticky Default GW Type-2 route.  Whether it actually gets sent to
+	 * bgpd is gated by the existing advertise-default-gw knob (checked via
+	 * advertise_gw_macip_enabled() inside zebra_evpn_{mac,neigh}_gw_macip_add()) -
+	 * same knob/CLI/ZAPI plumbing already used by the VXLAN path, so it is
+	 * NOT force-enabled here.  This allows remote PEs to suppress ARP/ND
+	 * for the gateway IP and enables seamless CE mobility without
+	 * re-ARPing, when the operator has opted in.  The MACIP send is
+	 * idempotent -- it overwrites any stale entry with fresh SID-embedded
+	 * attributes. */
+	if (evi->vrf_id != VRF_DEFAULT && evi->bridge_if)
 		zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
-	}
 
 	/*
 	 * Re-scan the kernel bridge FDB for this EVI's bridge + VLAN so local
@@ -1332,28 +1336,6 @@ void zebra_srv6_evi_remote_bum(struct zebra_evpn *zevpn, struct ipaddr *vtep_ip,
 /* Config write                                                                */
 /* -------------------------------------------------------------------------- */
 
-static int srv6_evi_config_write_one(struct hash_bucket *bucket, void *arg)
-{
-	struct zebra_srv6_evi *evi = bucket->data;
-	struct vty *vty = arg;
-	struct zebra_srv6_evi_bd *bd;
-
-	vty_out(vty, "   evi %u", evi->vni);
-	if (evi->locator[0])
-		vty_out(vty, " locator %s", evi->locator);
-	if (evi->bridge_if)
-		vty_out(vty, " bridge %s", evi->bridge_if->name);
-	vty_out(vty, "\n");
-	vty_out(vty, "    service-type %s\n", zevpn_l2_service2str(evi->svc_type));
-	frr_each (evi_bds, &evi->bds, bd)
-		vty_out(vty, "    vlan %u\n", bd->vid);
-	if (evi->vrf_id != VRF_DEFAULT)
-		vty_out(vty, "    vrf %s\n", vrf_id_to_name(evi->vrf_id));
-	vty_out(vty, "   exit\n");
-	return HASHWALK_CONTINUE;
-}
-
-
 int zebra_srv6_l2evpn_config_write(struct vty *vty)
 {
 	struct zebra_srv6_evi *evi;
@@ -1385,9 +1367,26 @@ int zebra_srv6_l2evpn_config_write(struct vty *vty)
 				zebra_sr6_encap_mode2str(evi->l2_encap_mode));
 		frr_each (evi_bds, &evi->bds, bd)
 			vty_out(vty, "    vlan %u\n", bd->vid);
-		vty_out(vty, "   exit\n");
+		if (evi->vrf_id != VRF_DEFAULT)
+			vty_out(vty, "    vrf %s\n", vrf_id_to_name(evi->vrf_id));
+		/*
+		 * Close with "!", not "exit" - "exit" is a generic command
+		 * available at virtually every vty node (including the
+		 * top-level CONFIG_NODE). In a shared/integrated frr.conf, a
+		 * foreign daemon (bgpd, isisd) that doesn't recognize this
+		 * EVI block's enclosing commands stays parked at CONFIG_NODE
+		 * while skipping each unrecognized line; the bare "exit" then
+		 * matches CONFIG_NODE's own exit command, which pops out of
+		 * config mode entirely and aborts the rest of the file read
+		 * for that daemon (see vty_config_node_exit() in lib/vty.c).
+		 * "!" is always a no-op comment, so it's silently skipped by
+		 * every daemon regardless of node state - matching the
+		 * existing convention used by the sibling locators/locator
+		 * blocks in this same file.
+		 */
+		vty_out(vty, "   !\n");
 	}
-	vty_out(vty, "  exit\n");
+	vty_out(vty, "  !\n");
 	return 0;
 }
 

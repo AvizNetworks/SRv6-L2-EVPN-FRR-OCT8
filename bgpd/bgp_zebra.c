@@ -542,47 +542,58 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
 	enum nexthop_types_t nhtype = 0;
 	enum blackhole_type bhtype = BLACKHOLE_UNSPEC;
-	struct zapi_route api;
+	/*
+	 * struct zapi_route is large (SRv6 seg6/seg6local fields add ~190
+	 * bytes per nexthop across MULTIPATH_NUM primary + backup slots,
+	 * ~11.6KB total) - heap allocate rather than putting it on the
+	 * stack of this event-driven callback, which can run at a deep
+	 * nesting level during bulk EVPN/VPWS route realization.
+	 */
+	struct zapi_route *api;
 	union g_addr nexthop = {};
 	ifindex_t ifindex = IFINDEX_INTERNAL;
 	uint32_t seg6local_action = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
 	const struct seg6local_context *seg6local_ctx = NULL;
-	int add, i;
+	int add, i, ret = 0;
 	struct bgp *bgp;
 
 	bgp = bgp_lookup_by_vrf_id(vrf_id);
 	if (!bgp)
 		return 0;
 
-	if (zapi_route_decode(zclient->ibuf, &api) < 0)
-		return -1;
+	api = XMALLOC(MTYPE_TMP, sizeof(struct zapi_route));
+
+	if (zapi_route_decode(zclient->ibuf, api) < 0) {
+		ret = -1;
+		goto done;
+	}
 
 	/* we completely ignore srcdest routes for now. */
-	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_SRCPFX))
-		return 0;
+	if (CHECK_FLAG(api->message, ZAPI_MESSAGE_SRCPFX))
+		goto done;
 
 	/* ignore link-local address. */
-	if (api.prefix.family == AF_INET6
-	    && IN6_IS_ADDR_LINKLOCAL(&api.prefix.u.prefix6))
-		return 0;
+	if (api->prefix.family == AF_INET6
+	    && IN6_IS_ADDR_LINKLOCAL(&api->prefix.u.prefix6))
+		goto done;
 
 	add = (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD);
 	if (add) {
-		if (api.nexthop_num == 0)
-			return 0;
+		if (api->nexthop_num == 0)
+			goto done;
 
-		ifindex = api.nexthops[0].ifindex;
-		nhtype = api.nexthops[0].type;
+		ifindex = api->nexthops[0].ifindex;
+		nhtype = api->nexthops[0].type;
 
 		/* api_nh structure has union of gate and bh_type */
 		if (nhtype == NEXTHOP_TYPE_BLACKHOLE) {
 			/* bh_type is only applicable if NEXTHOP_TYPE_BLACKHOLE*/
-			bhtype = api.nexthops[0].bh_type;
+			bhtype = api->nexthops[0].bh_type;
 		} else
-			nexthop = api.nexthops[0].gate;
+			nexthop = api->nexthops[0].gate;
 
-		seg6local_action = api.nexthops[0].seg6local_action;
-		seg6local_ctx = &api.nexthops[0].seg6local_ctx;
+		seg6local_action = api->nexthops[0].seg6local_action;
+		seg6local_ctx = &api->nexthops[0].seg6local_ctx;
 
 		/*
 		 * The ADD message is actually an UPDATE and there is no
@@ -594,40 +605,42 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 		 * source type.
 		 */
 		for (i = 0; i < ZEBRA_ROUTE_MAX; i++) {
-			if (i != api.type)
-				bgp_redistribute_delete(bgp, &api.prefix, i,
-							api.instance);
+			if (i != api->type)
+				bgp_redistribute_delete(bgp, &api->prefix, i,
+							api->instance);
 		}
 
 		/* Now perform the add/update. */
-		bgp_redistribute_add(bgp, &api.prefix, &nexthop, ifindex, nhtype, api.distance,
-				     bhtype, api.metric, api.type, api.instance, api.tag,
+		bgp_redistribute_add(bgp, &api->prefix, &nexthop, ifindex, nhtype, api->distance,
+				     bhtype, api->metric, api->type, api->instance, api->tag,
 				     seg6local_action, seg6local_ctx);
 	} else {
-		bgp_redistribute_delete(bgp, &api.prefix, api.type,
-					api.instance);
+		bgp_redistribute_delete(bgp, &api->prefix, api->type,
+					api->instance);
 	}
 
-	if (bgp_debug_zebra(&api.prefix)) {
+	if (bgp_debug_zebra(&api->prefix)) {
 		char buf[PREFIX_STRLEN];
 
 		if (add) {
-			inet_ntop(api.prefix.family, &nexthop, buf,
+			inet_ntop(api->prefix.family, &nexthop, buf,
 				  sizeof(buf));
 			zlog_debug("Rx route ADD %s %s[%d] %pFX nexthop %s (type %d if %u) metric %u distance %u tag %" ROUTE_TAG_PRI,
 				   bgp->name_pretty,
-				   zebra_route_string(api.type), api.instance,
-				   &api.prefix, buf, nhtype, ifindex,
-				   api.metric, api.distance, api.tag);
+				   zebra_route_string(api->type), api->instance,
+				   &api->prefix, buf, nhtype, ifindex,
+				   api->metric, api->distance, api->tag);
 		} else {
 			zlog_debug("Rx route DEL %s %s[%d] %pFX",
 				   bgp->name_pretty,
-				   zebra_route_string(api.type), api.instance,
-				   &api.prefix);
+				   zebra_route_string(api->type), api->instance,
+				   &api->prefix);
 		}
 	}
 
-	return 0;
+done:
+	XFREE(MTYPE_TMP, api);
+	return ret;
 }
 
 struct interface *if_lookup_by_ipv4(struct in_addr *addr, vrf_id_t vrf_id)

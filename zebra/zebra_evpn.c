@@ -552,8 +552,11 @@ int zebra_evpn_gw_macip_add(struct interface *ifp, struct zebra_evpn *zevpn,
  *   - srv6_l2vpn SID (End.DT2U)            (RFC 9252 section 5)
  *   - srv6_l3service SID (End.DT46)        (RFC 9252 section 5.1)
  *
- * Caller must set zevpn->advertise_gw_macip = 1 before calling so that
- * zebra_evpn_neigh_gw_macip_add() sends the entry to bgpd.
+ * Always registers the local MAC+IP entry; whether it actually gets sent to
+ * bgpd is decided by zebra_evpn_neigh_gw_macip_add() via
+ * advertise_gw_macip_enabled(zevpn) - the same advertise-default-gw knob
+ * (per-VNI or global) used by the VXLAN gw-macip path, so callers must NOT
+ * force zevpn->advertise_gw_macip here.
  */
 int zebra_srv6_evpn_gw_macip_add(struct interface *bridge_if,
 				  struct zebra_evpn *zevpn)
@@ -712,8 +715,25 @@ void zebra_evpn_gw_macip_add_for_evpn_hash(struct hash_bucket *bucket,
 	zevpn = (struct zebra_evpn *)bucket->data;
 
 	ifp = zevpn->vxlan_if;
-	if (!ifp)
+	if (!ifp) {
+		/*
+		 * SRv6 EVIs have no vxlan_if - the bridge itself is the SVI.
+		 * Re-run the SRv6 gw/svi-macip registration here so a
+		 * knob toggle that arrives *after* the EVI already realized
+		 * (and already has a local gw/SVI MAC+IP sitting unsent)
+		 * actually gets (re-)evaluated against the new knob state
+		 * and sent to bgpd - zebra_evpn_neigh_gw_macip_add() itself
+		 * re-checks advertise_svi_macip_enabled()/
+		 * advertise_gw_macip_enabled() on every call, so simply
+		 * re-invoking the add path here is sufficient; it's a no-op
+		 * if the entry was already correctly sent.
+		 */
+		struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(zevpn->vni);
+
+		if (evi && evi->bridge_if && evi->vrf_id != VRF_DEFAULT)
+			zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
 		return;
+	}
 	zif = ifp->info;
 
 	/* If down or not mapped to a bridge, we're done. */
@@ -1853,14 +1873,26 @@ void zebra_evpn_rem_macip_del(vni_t vni, const struct ethaddr *macaddr, uint16_t
 	}
 
 	/*
-	 * SRv6 EVI (no vxlan device): handle the remote MAC withdraw here.  The
-	 * VXLAN path below early-returns on a NULL vxlan_if, so without this the
-	 * remote MAC is never deleted and its peer-facing sr6 leaks (the sr6
-	 * reference is returned by zebra_evpn_mac_del's terminal release path).
-	 * SRv6 L2 EVPN carries MAC-only Type-2 (no IP/neigh).
+	 * SRv6 EVI (no vxlan device): handle the remote MAC/neigh withdraw here.
+	 * The VXLAN path below early-returns on a NULL vxlan_if, so without this
+	 * the remote MAC is never deleted and its peer-facing sr6 leaks (the
+	 * sr6 reference is returned by zebra_evpn_mac_del's terminal release
+	 * path). SRv6 L2 EVPN Type-2 routes can carry a host IP (symmetric IRB),
+	 * so the neigh must be uninstalled first - otherwise it keeps a
+	 * reference on the MAC (remote_neigh_count() stays non-zero) and the
+	 * MAC/sr6 FDB entry is never uninstalled either.
 	 */
 	if (zevpn->dp_ops == &zevpn_dp_ops_srv6) {
 		mac = zebra_evpn_mac_lookup(zevpn, macaddr);
+		if (ipa_len)
+			n = zebra_evpn_neigh_lookup(zevpn, ipaddr);
+
+		if (n && mac && CHECK_FLAG(n->flags, ZEBRA_NEIGH_REMOTE)) {
+			zvrf = zebra_vrf_get_evpn();
+			if (zvrf)
+				zebra_evpn_neigh_remote_uninstall(zevpn, zvrf, n, mac, ipaddr);
+		}
+
 		if (mac && CHECK_FLAG(mac->flags, ZEBRA_MAC_REMOTE))
 			zebra_evpn_rem_mac_del(zevpn, mac);
 		return;

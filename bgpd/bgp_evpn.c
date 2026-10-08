@@ -84,6 +84,11 @@ static void bgp_evpn_unlink_from_vni_svi_hash(struct bgp *bgp,
 					      struct bgpevpn *vpn);
 static unsigned int vni_svi_hash_key_make(const void *p);
 static bool vni_svi_hash_cmp(const void *p1, const void *p2);
+static int bgp_evpn_install_uninstall_table(struct bgp *bgp, afi_t afi,
+					    safi_t safi, const struct prefix *p,
+					    struct bgp_path_info *pi,
+					    int import, bool in_vni_rt,
+					    bool in_vrf_rt);
 static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
 						struct ipaddr *addr,
 						bool resolve);
@@ -1537,8 +1542,13 @@ static void build_evpn_route_extcomm(struct bgpevpn *vpn, struct attr *attr, int
 		ecommunity_append_val_unchecked(ecom, &eval_tmp);
 	}
 
-	/* Add RMAC, if told to. */
-	if (add_l3_ecomm) {
+	/* Add RMAC, if told to.
+	 * RMAC exists so a remote VXLAN PE can resolve L3 reachability via a
+	 * shared Router MAC + ARP/ND suppression; SRv6 does L3 resolution via
+	 * the End.DT4/DT6 SID (attr->srv6_l3service) instead, so the RMAC EC
+	 * is meaningless there - and since SRv6 codepaths never populate
+	 * attr->rmac, it would otherwise show up as an all-zero MAC. */
+	if (add_l3_ecomm && !is_vpn_srv6(vpn)) {
 		encode_rmac_extcomm(&eval_tmp, &attr->rmac);
 		ecommunity_add_val(ecom, &eval_tmp, true, true);
 	}
@@ -3100,6 +3110,26 @@ static int update_evpn_route(struct bgp *bgp, struct bgpevpn *vpn,
 			NULL /* ip */, 1, &global_pi, flags, seq,
 			false /* setup_sync */, NULL /* old_is_sync */);
 
+		if (p->prefix.route_type == BGP_EVPN_MAC_IP_ROUTE && !mac_only) {
+			SET_FLAG(global_pi->flags, BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP);
+			/*
+			 * VRF-only: this reflects the local host route into any
+			 * VRF whose import RT matches (symmetric IRB leak).
+			 * in_vni_rt=true would also self-import it into this
+			 * same VNI's own mac_table/ip_table, since a VNI's
+			 * import RT normally equals its own export RT - that
+			 * created a second BGP_ROUTE_IMPORTED path_info next
+			 * to the BGP_ROUTE_STATIC one already installed by
+			 * update_evpn_route_entry() just above, which
+			 * "show bgp l2vpn evpn srv6" then printed as an
+			 * apparent duplicate MAC/IP entry.
+			 */
+			bgp_evpn_install_uninstall_table(
+				bgp, afi, safi, bgp_dest_get_prefix(dest),
+				global_pi, 1 /* import */, false /* in_vni_rt */,
+				true /* in_vrf_rt */);
+		}
+
 		/* Schedule for processing and unlock node. */
 		bgp_process(bgp, dest, global_pi, afi, safi);
 		bgp_dest_unlock_node(dest);
@@ -3246,6 +3276,7 @@ void bgp_evpn_update_type2_route_entry(struct bgp *bgp, struct bgpevpn *vpn,
 	int route_change;
 	bool old_is_sync = false;
 	struct ecommunity *macvrf_soo = NULL;
+	bool mac_ip = false;
 
 	if (CHECK_FLAG(local_pi->flags, BGP_PATH_REMOVED))
 		return;
@@ -3264,6 +3295,7 @@ void bgp_evpn_update_type2_route_entry(struct bgp *bgp, struct bgpevpn *vpn,
 		evpn_type2_prefix_global_copy(
 			&evp, (struct prefix_evpn *)&dest->rn->p,
 			evpn_type2_path_info_get_mac(local_pi), NULL /* ip */);
+		mac_ip = true;
 	}
 
 	/*
@@ -3480,6 +3512,19 @@ void bgp_evpn_update_type2_route_entry(struct bgp *bgp, struct bgpevpn *vpn,
 
 		/* Schedule for processing and unlock node. */
 		bgp_process(bgp, global_dest, global_pi, afi, safi);
+
+		if (mac_ip) {
+			SET_FLAG(global_pi->flags, BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP);
+			/* VRF-only self-reflect; see comment at the other
+			 * local-origination call site in
+			 * bgp_evpn_update_type2_route_entry().
+			 */
+			bgp_evpn_install_uninstall_table(
+				bgp, afi, safi, (struct prefix *)&evp,
+				global_pi, 1 /* import */, false /* in_vni_rt */,
+				true /* in_vrf_rt */);
+		}
+
 		bgp_dest_unlock_node(global_dest);
 	}
 
@@ -3852,14 +3897,7 @@ static void bgp_evpn_srv6_refresh_vni_originator_hash(struct hash_bucket *bucket
 	if (!bucket)
 		return;
 
-	/*
-	 * Encapsulation is decided per-EVI now (is_vpn_srv6()), not by a
-	 * BGP-instance-wide mode, so gate on the EVI this bucket carries.
-	 */
 	vpn = (struct bgpevpn *)bucket->data;
-	if (!is_vpn_srv6(vpn))
-		return;
-
 	if (IS_IPADDR_V6(&vpn->originator_ip))
 		return;
 
@@ -5858,7 +5896,7 @@ static void update_advertise_vni_route(struct bgp *bgp, struct bgpevpn *vpn,
 	struct attr *attr;
 	afi_t afi = AFI_L2VPN;
 	safi_t safi = SAFI_EVPN;
-
+	bool mac_ip = false;
 	struct prefix_evpn tmp_evp;
 	const struct prefix_evpn *evp =
 		(const struct prefix_evpn *)bgp_dest_get_prefix(dest);
@@ -5910,6 +5948,18 @@ static void update_advertise_vni_route(struct bgp *bgp, struct bgpevpn *vpn,
 			NULL /* ip */, 1, &global_pi, 0,
 			mac_mobility_seqnum(attr), false /* setup_sync */,
 			NULL /* old_is_sync */);
+
+		if (mac_ip) {
+			SET_FLAG(global_pi->flags, BGP_PATH_LOCAL_IMPORT_EVPN_RT2_MACIP);
+			/* VRF-only self-reflect; see comment at the other
+			 * local-origination call site in
+			 * bgp_evpn_update_type2_route_entry().
+			 */
+			bgp_evpn_install_uninstall_table(
+				bgp, afi, safi, (struct prefix *)&tmp_evp,
+				global_pi, 1 /* import */, false /* in_vni_rt */,
+				true /* in_vrf_rt */);
+		}
 	} else {
 		/* Type-1 route */
 		struct bgp_evpn_es *es;
@@ -7577,6 +7627,15 @@ void bgp_evpn_handle_router_id_update(struct bgp *bgp, int withdraw)
 			     (void (*)(struct hash_bucket *,
 				       void *))update_router_id_vni,
 			     bgp);
+
+		/* Re-originate VPWS EAD-EVI routes: vpws_build_prefix() bakes
+		 * bgp->router_id into the NLRI once, at origination time. If a
+		 * VPWS SID became ready before the router-id was learned, the
+		 * route is stuck advertising 0.0.0.0 forever since nothing else
+		 * re-triggers it. Withdraw and re-advertise with the current
+		 * router-id now that it has (re)changed.
+		 */
+		bgp_evpn_vpws_reorigin_all(bgp);
 	}
 }
 
@@ -7607,16 +7666,6 @@ int bgp_evpn_handle_peer_established(struct peer *peer)
 		return 0;
 
 	if (!peer->connection->su_local || peer->connection->su_local->sa.sa_family != AF_INET6)
-		return 0;
-
-	/*
-	 * Encapsulation is per-EVI now, so there is no instance-wide SRv6
-	 * flag to test.  Gate on EVPN being enabled; the per-VRF
-	 * is_srv6_vrf_live() check below and the per-EVI is_vpn_srv6() check
-	 * in bgp_evpn_srv6_refresh_vni_originator_hash() make this a no-op for
-	 * any non-SRv6 EVI/VRF.
-	 */
-	if (!bgp_evpn->l2vpn_evpn_enabled)
 		return 0;
 
 	/* Type-5: re-trigger for every SRv6-live VRF instance. A no-op if
