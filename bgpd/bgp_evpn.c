@@ -3889,6 +3889,9 @@ static void update_routes_for_vni_hash(struct hash_bucket *bucket,
  * for it. A no-op for VNIs whose originator is already IPv6 (i.e.
  * already valid).
  */
+static void handle_tunnel_ip_change(struct bgp *bgp_vrf, struct bgp *bgp_evpn,
+				    struct bgpevpn *vpn,
+				    struct ipaddr *originator_ip);
 static void bgp_evpn_srv6_refresh_vni_originator_hash(struct hash_bucket *bucket, struct bgp *bgp)
 {
 	struct bgpevpn *vpn;
@@ -3917,7 +3920,19 @@ static void bgp_evpn_srv6_refresh_vni_originator_hash(struct hash_bucket *bucket
 	if (!bgp_evpn_srv6_local_originator(bgp, &originator))
 		return;
 
-	vpn->originator_ip = originator;
+	/*
+	 * The Type-3 (IMET) NLRI is keyed by the originator IP, so switching
+	 * from the IPv4 fallback to the derived IPv6 originator must WITHDRAW
+	 * the old self-IMET before re-originating under the new key.  A bare
+	 * `vpn->originator_ip = originator; update_routes_for_vni()` originates
+	 * a second self-IMET and orphans the IPv4-keyed one, which then lingers
+	 * forever with a stale End.DT2M SID (every later locator/SID
+	 * reallocation only refreshes the current, IPv6-keyed route).  Route
+	 * the change through handle_tunnel_ip_change(), which withdraws the old
+	 * Type-3, updates the tunnel-ip hash, and sets the new originator - then
+	 * re-originate Type-1/2/3 for the new key.
+	 */
+	handle_tunnel_ip_change(NULL /* L2VNI */, bgp, vpn, &originator);
 	update_routes_for_vni(bgp, vpn);
 }
 
