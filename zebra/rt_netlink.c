@@ -89,6 +89,7 @@
 #include "lib/srv6.h"
 #include "zebra/zebra_sr6.h"
 #include "zebra/zebra_dplane.h"
+#include "zebra/zebra_srv6_sid_stats.h"
 
 #ifndef AF_MPLS
 #define AF_MPLS 28
@@ -121,6 +122,22 @@ static struct in_addr ipv4_ll;
 
 static int netlink_nexthop_msg_encode_end_b6_encaps(struct nlmsghdr *nlmsg,
 						    const struct nexthop *nh, size_t buflen);
+
+static bool netlink_seg6local_add_counters(struct nlmsghdr *n, size_t maxlen)
+{
+       struct rtattr *nest;
+       uint64_t zero = 0;
+
+       nest = nl_attr_nest(n, maxlen, SEG6_LOCAL_COUNTERS);
+       if (!nest)
+               return false;
+       if (!nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_PACKETS, &zero, sizeof(zero)) ||
+           !nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_BYTES, &zero, sizeof(zero)) ||
+           !nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_ERRORS, &zero, sizeof(zero)))
+               return false;
+       nl_attr_nest_end(n, nest);
+       return true;
+}
 
 /* Is this a ipv4 over ipv6 route? */
 static bool is_route_v4_over_v6(unsigned char rtm_family,
@@ -2114,6 +2131,20 @@ static bool _netlink_nexthop_encode_seg6local_info(const struct nexthop *nexthop
 			 nexthop->nh_srv6->seg6local_action);
 		return false;
 	}
+
+	/*
+	 * SEG6_LOCAL_COUNTERS (Linux >= 5.3) is emitted ONLY for the SRv6 L2 EVPN
+	 * behaviors this feature introduces (End.DX2 / End.DT2U / End.DT2M).
+	 * Adding it to the pre-existing behaviors (End, End.X, End.T, End.DX4/6,
+	 * End.DT4/6/46) would make their seg6local route installs fail with EINVAL
+	 * on kernels < 5.3 that do not know the attribute - a silent regression for
+	 * existing SRv6 deployments on older kernels.
+	 */
+	if ((nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DX2 ||
+		nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT2U ||
+		nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT2M) &&
+		!netlink_seg6local_add_counters(nlmsg, buflen))
+			return false;
 
 	if (!_netlink_nexthop_encode_seg6local_flavor(nexthop, nlmsg, buflen))
 		return false;
