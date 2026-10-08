@@ -12201,20 +12201,32 @@ void bgp_show_srv6_evpn_instance(struct vty *vty, struct bgp *bgp)
 	vty_out(vty, "  L2VPN/EVPN SIDs:\n");
 
 	/* VPN (Type-5 DT4/DT6) - show whichever L3 AFI actually has a SID.
+	 * Per-VRF SID ('sid vpn per-vrf export auto') is stored in bgp->tovpn_sid
+	 * and takes precedence over per-AFI vpn_policy SIDs.
 	 * Falls back to "<unallocated>" when no L3VPN is configured.
 	 */
 	{
-		struct vpn_policy *vp_v4 = &bgp->vpn_policy[AFI_IP];
-		struct vpn_policy *vp_v6 = &bgp->vpn_policy[AFI_IP6];
-		struct vpn_policy *vp_l3 = vp_v6->tovpn_sid ? vp_v6 : vp_v4;
+		if (bgp->tovpn_sid) {
+			show_srv6_evpn_render_class(vty, "VPN (Type-5 DT4/DT6):",
+						    bgp->tovpn_sid, bgp->tovpn_sid_index,
+						    bgp->tovpn_sid_explicit, bgp->tovpn_sid_locator,
+						    CHECK_FLAG(bgp->vrf_flags, BGP_VRF_TOVPN_SID_AUTO),
+						    CHECK_FLAG(bgp->vrf_flags,
+							       BGP_VRF_TOVPN_SID_EXPLICIT),
+						    NULL, NULL);
+		} else {
+			struct vpn_policy *vp_v4 = &bgp->vpn_policy[AFI_IP];
+			struct vpn_policy *vp_v6 = &bgp->vpn_policy[AFI_IP6];
+			struct vpn_policy *vp_l3 = vp_v6->tovpn_sid ? vp_v6 : vp_v4;
 
-		show_srv6_evpn_render_class(vty, "VPN (Type-5 DT4/DT6):", vp_l3->tovpn_sid,
-					    vp_l3->tovpn_sid_index, vp_l3->tovpn_sid_explicit,
-					    vp_l3->tovpn_sid_locator,
-					    CHECK_FLAG(vp_l3->flags, BGP_VPN_POLICY_TOVPN_SID_AUTO),
-					    CHECK_FLAG(vp_l3->flags,
-						       BGP_VPN_POLICY_TOVPN_SID_EXPLICIT),
-					    NULL, NULL);
+			show_srv6_evpn_render_class(vty, "VPN (Type-5 DT4/DT6):", vp_l3->tovpn_sid,
+						    vp_l3->tovpn_sid_index, vp_l3->tovpn_sid_explicit,
+						    vp_l3->tovpn_sid_locator,
+						    CHECK_FLAG(vp_l3->flags, BGP_VPN_POLICY_TOVPN_SID_AUTO),
+						    CHECK_FLAG(vp_l3->flags,
+							       BGP_VPN_POLICY_TOVPN_SID_EXPLICIT),
+						    NULL, NULL);
+		}
 	}
 
 	/*

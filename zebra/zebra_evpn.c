@@ -539,6 +539,68 @@ int zebra_evpn_gw_macip_add(struct interface *ifp, struct zebra_evpn *zevpn,
 }
 
 /*
+ * zebra_srv6_evpn_gw_macip_add - RFC 9135 section 9 anycast gateway advertisement
+ * for SRv6 EVIs.
+ *
+ * Equivalent to zebra_evpn_gw_macip_add() but uses the EVPN bridge interface
+ * directly instead of vxlan_if (which is NULL for SRv6 EVIs).  Iterates all
+ * real IP addresses on the bridge SVI, skipping IPv6 link-locals, and
+ * registers each MAC+IP pair as a DEF_GW entry so bgpd will originate a
+ * Type-2 route with:
+ *   - Default Gateway extended community   (RFC 9135 section 9)
+ *   - MAC Mobility EC, Sticky bit, seq=0   (RFC 9135 section 9 + RFC 7432 section 7.7)
+ *   - srv6_l2vpn SID (End.DT2U)            (RFC 9252 section 5)
+ *   - srv6_l3service SID (End.DT46)        (RFC 9252 section 5.1)
+ *
+ * Caller must set zevpn->advertise_gw_macip = 1 before calling so that
+ * zebra_evpn_neigh_gw_macip_add() sends the entry to bgpd.
+ */
+int zebra_srv6_evpn_gw_macip_add(struct interface *bridge_if,
+				  struct zebra_evpn *zevpn)
+{
+	struct ethaddr macaddr;
+	struct zebra_mac *mac;
+	struct connected *c;
+
+	if (!bridge_if || !zevpn)
+		return -1;
+
+	memcpy(&macaddr.octet, bridge_if->hw_addr, ETH_ALEN);
+
+	frr_each_safe(if_connected, bridge_if->connected, c) {
+		struct ipaddr ip;
+
+		if (!CHECK_FLAG(c->conf, ZEBRA_IFC_REAL))
+			continue;
+
+		memset(&ip, 0, sizeof(ip));
+		if (c->address->family == AF_INET) {
+			ip.ipa_type = IPADDR_V4;
+			memcpy(&ip.ipaddr_v4, &c->address->u.prefix4,
+			       sizeof(struct in_addr));
+		} else if (c->address->family == AF_INET6) {
+			if (IN6_IS_ADDR_LINKLOCAL(&c->address->u.prefix6))
+				continue;
+			ip.ipa_type = IPADDR_V6;
+			memcpy(&ip.ipaddr_v6, &c->address->u.prefix6,
+			       sizeof(struct in6_addr));
+		} else {
+			continue;
+		}
+
+		mac = NULL;
+		zebra_evpn_mac_gw_macip_add(bridge_if, zevpn, &ip, &mac,
+					    &macaddr, zevpn->vid,
+					    true /* def_gw */);
+		if (mac)
+			zebra_evpn_neigh_gw_macip_add(bridge_if, zevpn, &ip,
+						      mac);
+	}
+
+	return 0;
+}
+
+/*
  * zebra_evpn_gw_macip_del_from_client
  */
 int zebra_evpn_gw_macip_del(struct interface *ifp, struct zebra_evpn *zevpn,
@@ -887,8 +949,12 @@ struct zebra_evpn *zebra_evpn_from_svi(struct interface *ifp,
 
 	/* Don't need to search in this case */
 	if (in_param.bridge_vlan_aware) {
-		if (!IS_ZEBRA_IF_VLAN(ifp))
-			return NULL;
+		if (!IS_ZEBRA_IF_VLAN(ifp)) {
+			/* For SRv6 EVIs the bridge itself serves as the SVI
+			 * (no VLAN sub-interface).  Fall through to the SRv6
+			 * EVI lookup below instead of returning NULL. */
+			goto try_srv6_evi;
+		}
 
 		zevpn = NULL;
 
@@ -913,7 +979,23 @@ struct zebra_evpn *zebra_evpn_from_svi(struct interface *ifp,
 	in_param.zif = zif;
 	zebra_ns_ifp_walk_all(zebra_evpn_from_svi_ns, &in_param);
 
-	return in_param.zevpn;
+	if (in_param.zevpn)
+		return in_param.zevpn;
+
+	/* No VxLAN interface found -- check if the bridge belongs to an
+	 * SRv6 EVI (vlan-based or vlan-bundle service).  This covers ARP/ND
+	 * events arriving on a pure SRv6 bridge that has no vxlan device, and
+	 * also the VLAN-aware case where the bridge itself is the SVI. */
+try_srv6_evi:
+	{
+		struct zebra_srv6_evi *evi =
+			zebra_srv6_evi_find_by_bridge(br_if);
+
+		if (evi)
+			return zebra_evpn_lookup(evi->vni);
+	}
+
+	return NULL;
 }
 
 static int zvni_map_to_macvlan_ns(struct interface *tmp_if, void *_in_param)
@@ -1716,18 +1798,17 @@ void zebra_evpn_rem_macip_add(vni_t vni, const struct ethaddr *macaddr, uint16_t
 	if (!zvrf)
 		return;
 
-	/* SRv6 EVIs: IRB/neigh not yet supported (design §8) — treat MAC-IP
-	 * routes as MAC-only so the neigh path (which assumes vxlan_if) is not
-	 * exercised.  The MAC still installs via the SRv6 backend.
-	 */
-	if (!ipa_len || zevpn->dp_ops == &zevpn_dp_ops_srv6) {
-		/* MAC update */
+	if (!ipa_len) {
+		/* MAC-only update */
 		zebra_evpn_mac_remote_macip_add(zevpn, zvrf, macaddr, vtep_ip, flags, seq, esi,
 						srv6_sid);
 	} else {
-		/* MAC-IP update
-		 * Add auto MAC if it doesn't exist.
+		/* MAC-IP update: install the MAC first (with its SRv6 SID if
+		 * present), then install the neighbor entry on the SVI/bridge.
 		 */
+		zebra_evpn_mac_remote_macip_add(zevpn, zvrf, macaddr, vtep_ip, flags, seq, esi,
+						srv6_sid);
+
 		mac = zebra_evpn_mac_lookup(zevpn, macaddr);
 		if (!mac) {
 			mac = zebra_evpn_mac_add_auto(zevpn, macaddr);

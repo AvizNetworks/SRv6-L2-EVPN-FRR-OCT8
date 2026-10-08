@@ -24,6 +24,7 @@
 #include "zebra/zebra_evpn.h"
 #include "zebra/zebra_evpn_mac.h"
 #include "zebra/zebra_evpn_neigh.h"
+#include "lib/zclient.h"
 #include "zebra/zebra_sr6.h"
 #include "zebra/zebra_dplane.h"
 #include "zebra/interface.h"
@@ -34,6 +35,7 @@
 #include "zebra/zebra_srv6.h"
 
 #include "lib/srv6.h"
+#include "lib/vrf.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, ZEBRA_SRV6_EVI, "SRv6 L2 EVPN EVI");
 DEFINE_MTYPE_STATIC(ZEBRA, ZEBRA_SRV6_EVI_BD, "SRv6 L2 EVPN EVI member BD");
@@ -181,8 +183,9 @@ static int srv6_dp_flood(struct zebra_evpn *zevpn, void *arg)
 
 static struct interface *srv6_dp_bridge(struct zebra_evpn *zevpn)
 {
-	/* TODO(phase3): return the EVI's vlan-aware bridge_if. */
-	return NULL;
+	struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(zevpn->vni);
+
+	return evi ? evi->bridge_if : NULL;
 }
 
 const struct zevpn_dp_ops zevpn_dp_ops_srv6 = {
@@ -576,6 +579,17 @@ void zebra_srv6_evi_set_bridge(struct zebra_srv6_evi *evi, struct interface *bri
 	zebra_srv6_evi_realize(evi);
 }
 
+void zebra_srv6_evi_set_vrf(struct zebra_srv6_evi *evi, vrf_id_t vrf_id)
+{
+	if (!evi)
+		return;
+	if (evi->vrf_id == vrf_id)
+		return;
+	evi->vrf_id = vrf_id;
+	/* Re-realize so the VNI_ADD to bgpd carries the updated tenant_vrf_id. */
+	zebra_srv6_evi_realize(evi);
+}
+
 int zebra_srv6_evi_set_service(struct zebra_srv6_evi *evi, enum zevpn_l2_service svc)
 {
 	struct zebra_srv6_evi_bd *bd;
@@ -804,6 +818,10 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	 */
 	zevpn->dp_ops = &zevpn_dp_ops_srv6;
 	zevpn->bridge_if = evi->bridge_if;
+	/* Propagate tenant VRF so bgpd's VNI_ADD carries the correct
+	 * tenant_vrf_id for symmetric IRB (bgpevpn_link_to_l3vni). */
+	if (evi->vrf_id != VRF_DEFAULT)
+		zevpn->vrf_id = evi->vrf_id;
 
 	/*
 	 * Allocate this EVI's own End.DT2U/End.DT2M service SIDs from its
@@ -1008,6 +1026,17 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	SET_FLAG(zevpn->flags, ZEVPN_READY_FOR_BGP);
 	zebra_evpn_send_add_to_client(zevpn);
 
+	/* RFC 9135 section 9: Anycast Gateway advertisement.
+	 * For IRB-enabled EVIs (VRF binding present), advertise the bridge
+	 * SVI MAC+IP as a sticky Default GW Type-2 route.  This allows remote
+	 * PEs to suppress ARP/ND for the gateway IP and enables seamless CE
+	 * mobility without re-ARPing.  The MACIP send is idempotent -- it
+	 * overwrites any stale entry with fresh SID-embedded attributes. */
+	if (evi->vrf_id != VRF_DEFAULT && evi->bridge_if) {
+		zevpn->advertise_gw_macip = 1;
+		zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
+	}
+
 	/*
 	 * Re-scan the kernel bridge FDB for this EVI's bridge + VLAN so local
 	 * MACs already present in the kernel are originated as Type-2.  Local
@@ -1081,6 +1110,24 @@ vni_t zebra_srv6_evi_vni_by_bridge_vlan(const struct interface *br_if, vlanid_t 
 			break;
 	}
 	return found;
+}
+
+/* Find the first SRv6 EVI whose bridge_if matches br_if.
+ * Used by zebra_evpn_from_svi() to resolve ARP/ND events on SRv6 bridges. */
+struct zebra_srv6_evi *
+zebra_srv6_evi_find_by_bridge(const struct interface *br_if)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (!br_if)
+		return NULL;
+
+	frr_each (srv6_evi_htab, srv6_evi_table, evi) {
+		if (evi->bridge_if == br_if)
+			return evi;
+	}
+
+	return NULL;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1285,6 +1332,28 @@ void zebra_srv6_evi_remote_bum(struct zebra_evpn *zevpn, struct ipaddr *vtep_ip,
 /* Config write                                                                */
 /* -------------------------------------------------------------------------- */
 
+static int srv6_evi_config_write_one(struct hash_bucket *bucket, void *arg)
+{
+	struct zebra_srv6_evi *evi = bucket->data;
+	struct vty *vty = arg;
+	struct zebra_srv6_evi_bd *bd;
+
+	vty_out(vty, "   evi %u", evi->vni);
+	if (evi->locator[0])
+		vty_out(vty, " locator %s", evi->locator);
+	if (evi->bridge_if)
+		vty_out(vty, " bridge %s", evi->bridge_if->name);
+	vty_out(vty, "\n");
+	vty_out(vty, "    service-type %s\n", zevpn_l2_service2str(evi->svc_type));
+	frr_each (evi_bds, &evi->bds, bd)
+		vty_out(vty, "    vlan %u\n", bd->vid);
+	if (evi->vrf_id != VRF_DEFAULT)
+		vty_out(vty, "    vrf %s\n", vrf_id_to_name(evi->vrf_id));
+	vty_out(vty, "   exit\n");
+	return HASHWALK_CONTINUE;
+}
+
+
 int zebra_srv6_l2evpn_config_write(struct vty *vty)
 {
 	struct zebra_srv6_evi *evi;
@@ -1347,4 +1416,40 @@ void zebra_srv6_l2evpn_terminate(void)
 	}
 	srv6_evi_htab_fini(srv6_evi_table);
 	srv6_evi_inited = false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lab helper: inject static neighbor into EVPN table                         */
+/* -------------------------------------------------------------------------- */
+
+void zebra_srv6_evi_static_neigh_inject(struct zebra_evpn *zevpn,
+					struct interface *ifp,
+					struct ipaddr *ip,
+					struct ethaddr *mac)
+{
+	struct zebra_mac *zmac;
+
+	/* Install in kernel ARP table (inside the PE namespace via dplane) */
+	dplane_local_neigh_add(ifp, ip, mac, false, true, false);
+
+	/* Try the normal neighbor update path (installs in EVPN neigh table). */
+	zebra_evpn_local_neigh_update(zevpn, ifp, ip, mac,
+				      false /* is_router */,
+				      false /* local_inactive */,
+				      true /* dp_static */);
+
+	/* For SRv6 EVIs, zebra_evpn_local_neigh_update() may return success
+	 * but silently skip the bgpd notification (no vxlan_if path).
+	 * Always send MACIP ADD directly so bgpd builds the Type-2 route. */
+	zmac = zebra_evpn_mac_lookup(zevpn, mac);
+	if (zmac && CHECK_FLAG(zmac->flags, ZEBRA_MAC_LOCAL)) {
+		zebra_evpn_macip_send_msg_to_client(zevpn->vni, mac, ip,
+						    0 /* flags */, 0 /* seq */,
+						    ZEBRA_NEIGH_ACTIVE,
+						    NULL /* es */,
+						    ZEBRA_MACIP_ADD);
+	} else {
+		zlog_warn("srv6 static-neigh: no local MAC %pEA in VNI %u -- skipping bgpd notify",
+			  mac, zevpn->vni);
+	}
 }

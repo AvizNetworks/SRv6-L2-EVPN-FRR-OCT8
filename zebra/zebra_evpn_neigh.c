@@ -31,8 +31,19 @@
 #include "zebra/zebra_evpn_mh.h"
 #include "zebra/zebra_evpn_neigh.h"
 #include "zebra/zebra_evpn_mac.h"
+#include "zebra/zebra_srv6_l2evpn.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, NEIGH, "EVI Neighbor");
+
+/* Return the zebra_vrf for a zevpn, working for both VxLAN and SRv6 EVIs.
+ * VxLAN EVIs store the vrf via vxlan_if; SRv6 EVIs have no vxlan_if so we
+ * fall back to the global EVPN VRF. */
+static inline struct zebra_vrf *zebra_evpn_get_zvrf(struct zebra_evpn *zevpn)
+{
+	if (zevpn->vxlan_if && zevpn->vxlan_if->vrf)
+		return (struct zebra_vrf *)zevpn->vxlan_if->vrf->info;
+	return zebra_vrf_get_evpn();
+}
 
 int neigh_list_cmp(void *p1, void *p2)
 {
@@ -578,8 +589,8 @@ void zebra_evpn_sync_neigh_del(struct zebra_neigh *n)
 		struct zebra_ns *zns = NULL;
 		struct interface *ifp = NULL;
 
-		if (n->zevpn && n->zevpn->vxlan_if && n->zevpn->vxlan_if->vrf) {
-			struct zebra_vrf *zvrf = n->zevpn->vxlan_if->vrf->info;
+		if (n->zevpn) {
+			struct zebra_vrf *zvrf = zebra_evpn_get_zvrf(n->zevpn);
 
 			if (zvrf)
 				zns = zvrf->zns;
@@ -912,7 +923,7 @@ void zebra_evpn_process_neigh_on_local_mac_change(struct zebra_evpn *zevpn,
 	struct listnode *node = NULL;
 	struct zebra_vrf *zvrf = NULL;
 
-	zvrf = zevpn->vxlan_if->vrf->info;
+	zvrf = zebra_evpn_get_zvrf(zevpn);
 
 	if (IS_ZEBRA_DEBUG_VXLAN)
 		zlog_debug("Processing neighbors on local MAC %pEA %s, VNI %u",
@@ -1286,11 +1297,11 @@ int zebra_evpn_local_neigh_update(struct zebra_evpn *zevpn,
 		}
 	}
 
-	zvrf = zevpn->vxlan_if->vrf->info;
+	zvrf = zebra_evpn_get_zvrf(zevpn);
 	if (!zvrf) {
 		if (IS_ZEBRA_DEBUG_VXLAN)
-			zlog_debug("        Unable to find vrf for: %d",
-				   zevpn->vxlan_if->vrf->vrf_id);
+			zlog_debug("        Unable to find vrf for VNI %u",
+				   zevpn->vni);
 		return -1;
 	}
 
@@ -2339,7 +2350,7 @@ int zebra_evpn_neigh_del_ip(struct zebra_evpn *zevpn, const struct ipaddr *ip)
 		return 0;
 	}
 
-	zvrf = zevpn->vxlan_if->vrf->info;
+	zvrf = zebra_evpn_get_zvrf(zevpn);
 	if (!zvrf) {
 		zlog_debug("%s: VNI %u vrf lookup failed.", __func__,
 			   zevpn->vni);

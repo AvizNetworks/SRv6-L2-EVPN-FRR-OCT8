@@ -620,17 +620,24 @@ static inline void bgpevpn_link_to_l3vni(struct bgpevpn *vpn)
 	if (!bgp_vrf)
 		return;
 
-	/* or if there is no l3vni */
+	/* SRv6 path: VRF has a per-VRF DT46 SID (no l3vni needed).
+	 * Both L2 (DT2U) and L3 (DT4/DT6) SIDs are advertised in
+	 * Type-2 routes for symmetric IRB per RFC 9252 section 5.1. */
+	if (bgp_vrf->tovpn_sid) {
+		vpn->bgp_vrf = bgp_lock(bgp_vrf);
+		listnode_add_sort(bgp_vrf->l2vnis, vpn);
+		SET_FLAG(vpn->flags, VNI_FLAG_USE_TWO_LABELS);
+		bgp_evpn_es_evi_vrf_ref(vpn);
+		return;
+	}
+
+	/* VxLAN/MPLS path: requires l3vni */
 	if (!bgp_vrf->l3vni)
 		return;
 
-	/* associate the vpn to the bgp_vrf instance */
 	vpn->bgp_vrf = bgp_lock(bgp_vrf);
 	listnode_add_sort(bgp_vrf->l2vnis, vpn);
 
-	/*
-	 * check if we are advertising two labels for this vpn
-	 */
 	if (!CHECK_FLAG(bgp_vrf->vrf_flags, BGP_VRF_L3VNI_PREFIX_ROUTES_ONLY))
 		SET_FLAG(vpn->flags, VNI_FLAG_USE_TWO_LABELS);
 
@@ -650,6 +657,13 @@ static inline int is_vni_live(struct bgpevpn *vpn)
 static inline int is_l3vni_live(struct bgp *bgp_vrf)
 {
 	return (bgp_vrf->l3vni && bgp_vrf->l3vni_svi_ifindex);
+}
+
+/* True when a VRF has an SRv6 End.DT46 SID -- the SRv6 equivalent of
+ * is_l3vni_live() for VxLAN.  Use wherever l3vni guards block SRv6 VRFs. */
+static inline bool is_srv6_vrf_live(struct bgp *bgp_vrf)
+{
+	return bgp_vrf->tovpn_sid != NULL;
 }
 
 static inline int is_rd_configured(struct bgpevpn *vpn)
